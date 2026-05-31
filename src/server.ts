@@ -3952,7 +3952,7 @@ server.registerTool(
       const clientInfo = server.server.getClientVersion();
       const signal = detectPlatform(clientInfo ?? undefined);
       platformFlag = ` --platform ${signal.platform}`;
-      nodeOpts = isInProcessPluginPlatform(signal.platform)
+      nodeOpts = isInProcessPluginPlatform(signal.platform) && runtimes.javascript
         ? { platform: signal.platform, jsRuntime: runtimes.javascript }
         : undefined;
     } catch { /* best effort — fall back to upgrade()'s own detect */ }

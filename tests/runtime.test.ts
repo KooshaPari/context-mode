@@ -744,3 +744,224 @@ describe("buildCommand shell variants", () => {
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// #731: ctx_execute(language: "javascript") fails when the host process
+// is a bun-compiled self-contained binary (OpenCode, Kilo, etc).
+//
+// detectRuntimes() returned `process.execPath` for `javascript`, which
+// in those hosts resolves to `opencode.exe` / `opencode` — NOT node.
+// PolyglotExecutor then spawned `opencode.exe <script.js>` which the
+// yargs CLI rejects with "Failed to change directory" (it treats the
+// path as a cwd, not a script).
+//
+// The fix gates execPath on the existing JS_RUNTIMES allowlist from
+// src/adapters/types.ts (single source of truth — same set used by
+// PR #708's buildNodeCommand). When the execPath basename is not a
+// known JS runtime, fall back to PATH-resolved `node`. If node is
+// also missing, return null and let ctx_doctor surface the error.
+//
+// Preserves PR #190 (snap-node fix, f69b0d2): snap wrapper's basename
+// is `node`, which IS in JS_RUNTIMES → execPath is still returned.
+// ─────────────────────────────────────────────────────────
+describe("detectRuntimes — JS runtime fallback for in-process plugin hosts (#731)", () => {
+  let originalExecPath: string;
+
+  beforeEach(() => {
+    originalExecPath = process.execPath;
+  });
+
+  afterEach(() => {
+    vi.resetModules();
+    vi.doUnmock("node:child_process");
+    vi.doUnmock("node:fs");
+    Object.defineProperty(process, "execPath", {
+      value: originalExecPath,
+      configurable: true,
+    });
+  });
+
+  function stubExecPath(value: string): void {
+    Object.defineProperty(process, "execPath", {
+      value,
+      configurable: true,
+    });
+  }
+
+  test("Windows OpenCode binary host (opencode.exe) falls back to 'node' on PATH", async () => {
+    stubExecPath("C:\\Users\\Test\\opencode.exe");
+
+    // No bun anywhere; commandExists("node") returns true. We don't
+    // stub process.platform here — commandExists uses whichever probe
+    // matches the test host (POSIX: `command -v`, Windows: `where`).
+    const execSync = vi.fn((cmd: string) => {
+      if (cmd === "where bun" || cmd === "command -v bun") throw new Error("bun not found");
+      if (cmd === "where node") return "C:\\Program Files\\nodejs\\node.exe\r\n";
+      if (cmd === "command -v node") return "/usr/local/bin/node\n";
+      // Other commandExists() probes (tsx, ts-node, ruby, go, …) → not found.
+      if (/^where\s/.test(cmd)) throw new Error("not found");
+      if (/^command -v\s/.test(cmd)) throw new Error("not found");
+      throw new Error(`unmocked execSync: ${cmd}`);
+    });
+    const execFileSync = vi.fn(() => Buffer.from("ok\n"));
+    const existsSync = vi.fn(() => false); // no bun fallback paths exist
+
+    vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, existsSync };
+    });
+
+    const { detectRuntimes } = await import("../src/runtime.js");
+    const r = detectRuntimes();
+
+    // Must NOT return the opencode.exe path — that's the bug.
+    expect(r.javascript).not.toBe("C:\\Users\\Test\\opencode.exe");
+    expect(r.javascript).toBe("node");
+  });
+
+  test("POSIX OpenCode binary host (opencode) falls back to 'node' on PATH — cross-OS (not Windows-only)", async () => {
+    stubExecPath("/usr/local/bin/opencode");
+
+    const execSync = vi.fn((cmd: string) => {
+      if (cmd === "where bun") throw new Error("bun not found");
+      if (cmd === "command -v node") return "/usr/local/bin/node\n";
+      if (/^where\s/.test(cmd)) throw new Error("not found");
+      if (/^command -v\s/.test(cmd)) throw new Error("not found");
+      throw new Error(`unmocked execSync: ${cmd}`);
+    });
+    const execFileSync = vi.fn(() => Buffer.from("ok\n"));
+    const existsSync = vi.fn(() => false);
+
+    vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, existsSync };
+    });
+
+    const { detectRuntimes } = await import("../src/runtime.js");
+    const r = detectRuntimes();
+
+    expect(r.javascript).not.toBe("/usr/local/bin/opencode");
+    expect(r.javascript).toBe("node");
+  });
+
+  test("returns null when host is non-JS binary AND node is missing — surfaces actionable error", async () => {
+    stubExecPath("/usr/local/bin/opencode");
+
+    const execSync = vi.fn((cmd: string) => {
+      // Nothing exists — no bun, no node, no other runtime.
+      if (/^where\s/.test(cmd)) throw new Error("not found");
+      if (/^command -v\s/.test(cmd)) throw new Error("not found");
+      throw new Error(`unmocked execSync: ${cmd}`);
+    });
+    const execFileSync = vi.fn(() => {
+      throw new Error("not found");
+    });
+    const existsSync = vi.fn(() => false);
+
+    vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, existsSync };
+    });
+
+    const { detectRuntimes } = await import("../src/runtime.js");
+    const r = detectRuntimes();
+
+    expect(r.javascript).toBeNull();
+  });
+
+  test("regression: snap-node host (#190 / f69b0d2) preserves execPath — basename === 'node'", async () => {
+    // The snap wrapper's binary is literally named `node`; PR #190 used
+    // process.execPath to avoid re-invoking the snap wrapper via PATH.
+    // The allowlist gate must NOT regress this — basename "node" is in
+    // JS_RUNTIMES so execPath is returned as-is.
+    stubExecPath("/snap/node/current/bin/node");
+
+    const execSync = vi.fn((cmd: string) => {
+      if (cmd === "where bun") throw new Error("bun not found");
+      if (/^command -v\s/.test(cmd)) throw new Error("not found");
+      if (/^where\s/.test(cmd)) throw new Error("not found");
+      throw new Error(`unmocked execSync: ${cmd}`);
+    });
+    const execFileSync = vi.fn(() => Buffer.from("ok\n"));
+    const existsSync = vi.fn(() => false);
+
+    vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, existsSync };
+    });
+
+    const { detectRuntimes } = await import("../src/runtime.js");
+    const r = detectRuntimes();
+
+    // Snap path returned verbatim — NOT collapsed to bare "node" (would
+    // re-invoke the snap wrapper, the original #190 bug).
+    expect(r.javascript).toBe("/snap/node/current/bin/node");
+  });
+
+  test("regression: bun host preserves execPath — basename matches BUN allowlist", async () => {
+    // When the host IS bun (e.g. opencode binary built with bun's
+    // bundler exposes execPath as the actual bun binary), the allowlist
+    // permits it and bunCommand()'s own detection sets javascript to bun
+    // anyway. This case asserts the basename check doesn't accidentally
+    // demote a bun execPath.
+    stubExecPath("/home/user/.bun/bin/bun");
+
+    const execSync = vi.fn((cmd: string) => {
+      // bunExists() — make `where bun` / `command -v bun` succeed so
+      // bunCommand() returns the bun path itself.
+      if (cmd === "where bun") return "/home/user/.bun/bin/bun\n";
+      if (cmd === "command -v bun") return "/home/user/.bun/bin/bun\n";
+      if (/^where\s/.test(cmd)) throw new Error("not found");
+      if (/^command -v\s/.test(cmd)) throw new Error("not found");
+      throw new Error(`unmocked execSync: ${cmd}`);
+    });
+    const execFileSync = vi.fn(() => Buffer.from("1.1.0\n"));
+    const existsSync = vi.fn(() => false);
+
+    vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, existsSync };
+    });
+
+    const { detectRuntimes } = await import("../src/runtime.js");
+    const r = detectRuntimes();
+
+    // bun branch fires first; javascript should be a bun runtime (not
+    // collapsed to bare "node" even though basename(execPath) === "bun").
+    expect(r.javascript).toMatch(/bun$/);
+  });
+
+  test("doctor surfaces clear error when javascript runtime is null", async () => {
+    // When no JS runtime is available, doctor must NOT crash with a
+    // cryptic spawn ENOENT — it should produce an actionable message
+    // pointing at the missing runtime. This is the user-facing
+    // expectation from #731 when the binary host AND PATH both lack node.
+    const { getRuntimeSummary } = await import("../src/runtime.js");
+    const runtimes: RuntimeMap = {
+      javascript: null as unknown as RuntimeMap["javascript"],
+      typescript: null,
+      python: null,
+      shell: "bash",
+      ruby: null,
+      go: null,
+      rust: null,
+      php: null,
+      perl: null,
+      r: null,
+      elixir: null,
+      csharp: null,
+    };
+
+    const summary = getRuntimeSummary(runtimes);
+
+    // Must mention JavaScript and an actionable hint, not a literal `null`.
+    expect(summary).toMatch(/JavaScript/);
+    expect(summary).toMatch(/not available|install/i);
+    expect(summary).not.toMatch(/JavaScript: null/);
+  });
+});

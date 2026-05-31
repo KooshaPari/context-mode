@@ -1,5 +1,6 @@
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { JS_RUNTIMES } from "./adapters/types.js";
 
 /**
  * Allowlist for SHELL env override. Only POSIX shells + Windows shells permit
@@ -53,7 +54,7 @@ export interface RuntimeInfo {
 }
 
 export interface RuntimeMap {
-  javascript: string;
+  javascript: string | null;
   typescript: string | null;
   python: string | null;
   shell: string;
@@ -228,6 +229,60 @@ function getVersion(cmd: string, args: string[] = ["--version"]): string {
   }
 }
 
+/**
+ * Resolve the JavaScript runtime used by PolyglotExecutor.
+ *
+ * PR #190 (f69b0d2) made `process.execPath` the default so snap-Node
+ * envs would not re-invoke the snap wrapper via PATH. That assumed
+ * `process.execPath` always points at a JS runtime — true on Node,
+ * tsx, and snap-Node, but FALSE when context-mode runs in-process
+ * inside a bun-compiled self-contained binary (OpenCode, Kilo, …).
+ * In those hosts, `process.execPath` resolves to `opencode.exe` /
+ * `opencode` (NOT node), and spawning that with a `.js` argument
+ * triggers the yargs "Failed to change directory" error (#731).
+ *
+ * Fix: gate `process.execPath` on the existing `JS_RUNTIMES`
+ * allowlist (single source of truth — same set used by
+ * `buildNodeCommand()` in src/adapters/types.ts since PR #708). When
+ * the execPath basename is not a known JS runtime, fall back to a
+ * PATH-resolved `node`. If neither is reachable, return `null` and
+ * let ctx_doctor surface an actionable error.
+ *
+ * The cross-OS guard is the allowlist itself — NOT a `win32` check.
+ * OpenCode ships self-contained binaries on macOS and Linux too,
+ * and the bug reproduces identically there.
+ */
+export function resolveJavascriptRuntime(
+  bun: string | null,
+  deps: {
+    execPath?: string;
+    commandExists?: (cmd: string) => boolean;
+  } = {},
+): string | null {
+  if (bun) return bun;
+
+  const execPath = deps.execPath ?? process.execPath;
+  const cmdExists = deps.commandExists ?? commandExists;
+
+  // Cross-OS basename: split on either separator, strip optional `.exe`.
+  const base = execPath
+    .split(/[\\/]/)
+    .pop()!
+    .replace(/\.exe$/i, "");
+
+  if (JS_RUNTIMES.has(base)) {
+    // Real JS runtime (node, bun, deno) — preserves #190 snap-Node fix
+    // because the snap wrapper's binary is literally named `node`.
+    return execPath;
+  }
+
+  // Host binary (opencode/kilo/etc.) — fall back to node on PATH.
+  if (cmdExists("node")) return "node";
+
+  // No usable runtime — doctor + summary must handle null gracefully.
+  return null;
+}
+
 export function detectRuntimes(): RuntimeMap {
   const hasBun = bunExists();
   const bun = hasBun ? bunCommand() : null;
@@ -250,7 +305,7 @@ export function detectRuntimes(): RuntimeMap {
     : null;
 
   return {
-    javascript: bun ?? process.execPath,
+    javascript: resolveJavascriptRuntime(bun),
     typescript: bun
       ? bun
       : commandExists("tsx")
@@ -291,9 +346,17 @@ export function getRuntimeSummary(runtimes: RuntimeMap): string {
   const lines: string[] = [];
   const bunPreferred = runtimes.javascript?.endsWith("bun") ?? false;
 
-  lines.push(
-    `  JavaScript: ${runtimes.javascript} (${getVersion(runtimes.javascript)})${bunPreferred ? " ⚡" : ""}`,
-  );
+  if (runtimes.javascript) {
+    lines.push(
+      `  JavaScript: ${runtimes.javascript} (${getVersion(runtimes.javascript)})${bunPreferred ? " ⚡" : ""}`,
+    );
+  } else {
+    // #731: host binary (opencode/kilo) AND no PATH-resolvable node.
+    // Surface actionable guidance instead of rendering literal `null`.
+    lines.push(
+      `  JavaScript: not available (install node or bun — host process is not a JS runtime)`,
+    );
+  }
 
   if (runtimes.typescript) {
     lines.push(
@@ -379,6 +442,14 @@ export function buildCommand(
 ): string[] {
   switch (language) {
     case "javascript":
+      if (!runtimes.javascript) {
+        // #731: in-process plugin host (opencode/kilo binary) AND no
+        // PATH-resolvable node. Refuse early with an actionable error
+        // instead of spawning the host binary (the original bug shape).
+        throw new Error(
+          "No JavaScript runtime available. Install Node.js or Bun on PATH (the host process is not itself a JS runtime).",
+        );
+      }
       return BUN_BASENAME.test(runtimeBasename(runtimes.javascript))
         ? [runtimes.javascript, "run", filePath]
         : [runtimes.javascript, filePath];
