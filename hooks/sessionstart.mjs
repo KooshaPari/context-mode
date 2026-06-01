@@ -30,6 +30,7 @@ await runHook(async () => {
     readStdin,
     parseStdin,
     getSessionId,
+    getInputProjectDir,
     getSessionDBPath,
     getSessionEventsPath,
     getCleanupFlagPath,
@@ -38,7 +39,7 @@ await runHook(async () => {
   const { writeSessionEventsFile, buildSessionDirective, getSessionEvents } = await import(
     "./session-directive.mjs"
   );
-  const { createSessionLoaders } = await import("./session-loaders.mjs");
+  const { createSessionLoaders, attributeAndInsertEvents } = await import("./session-loaders.mjs");
   const { join, dirname } = await import("node:path");
   const { fileURLToPath } = await import("node:url");
   const { readFileSync, unlinkSync, readdirSync, rmSync, lstatSync } = await import("node:fs");
@@ -49,7 +50,40 @@ await runHook(async () => {
 
   // Resolve absolute path for imports (fileURLToPath for Windows compat)
   const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
-  const { loadSessionDB } = createSessionLoaders(HOOK_DIR);
+  const { loadSessionDB, loadProjectAttribution } = createSessionLoaders(HOOK_DIR);
+
+  // Emit a `session_start` canonical event at the boundary of each session
+  // lifecycle transition (startup / resume / compact). The platform's insight
+  // engine joins on `category='session_start'` to compute per-session
+  // aggregates (~60 of 180 patterns depend on this anchor row). Bridge
+  // forwards via attributeAndInsertEvents which also stamps the rollup
+  // snapshot — safe for the FIRST event of a fresh session.
+  async function emitSessionStartLifecycle(db, sessionId, source, projectDir, input) {
+    try {
+      const { resolveProjectAttributions } = await loadProjectAttribution();
+      const lifecycleEvent = {
+        type: "session_start",
+        category: "session_start",
+        data: JSON.stringify({
+          source,
+          project_dir: projectDir,
+          started_at: Math.floor(Date.now() / 1000),
+        }),
+        priority: 1,
+      };
+      attributeAndInsertEvents(
+        db,
+        sessionId,
+        [lifecycleEvent],
+        input,
+        projectDir,
+        "SessionStart",
+        resolveProjectAttributions,
+      );
+    } catch {
+      // Best-effort — lifecycle emission failure MUST NOT block session start.
+    }
+  }
 
   // Self-heal a partial plugin cache install before anything else
   // touches the cache dir. The Algo-D4 boot gate and the #604
@@ -202,6 +236,13 @@ await runHook(async () => {
         } catch { /* best-effort */ }
       }
 
+      // Emit lifecycle anchor BEFORE close — engine joins on
+      // category='session_start' to compute per-session aggregates.
+      // Cross-platform projectDir via getInputProjectDir (covers cursor's
+      // workspace_roots[], codex/gemini/qwen's *_PROJECT_DIR env vars,
+      // CC's CLAUDE_PROJECT_DIR, falls back to input.cwd and process.cwd).
+      const projectDirCompact = getInputProjectDir(input);
+      await emitSessionStartLifecycle(db, sessionId, "compact", projectDirCompact, input);
       db.close();
     } else if (source === "resume") {
       // User invoked --continue, --resume, or /resume — clear cleanup flag so
@@ -234,6 +275,10 @@ await runHook(async () => {
         }
       }
 
+      const projectDirResume = getInputProjectDir(input);
+      if (sessionId) {
+        await emitSessionStartLifecycle(db, sessionId, "resume", projectDirResume, input);
+      }
       db.close();
     } else if (source === "startup") {
       // Fresh session (no --continue) — clean slate, capture CLAUDE.md rules.
@@ -293,6 +338,11 @@ await runHook(async () => {
           }
         } catch { /* file doesn't exist — skip */ }
       }
+
+      // Lifecycle anchor for a fresh session — emits BEFORE the CLAUDE.md
+      // rule events have been forwarded so the `session_start` row lands
+      // as the very first row the platform sees for this session.
+      await emitSessionStartLifecycle(db, sessionId, "startup", projectDir, input);
 
       db.close();
 

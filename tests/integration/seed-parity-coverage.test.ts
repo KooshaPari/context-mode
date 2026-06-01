@@ -237,6 +237,101 @@ describe("seed-parity coverage gate", () => {
     db.close?.();
   });
 
+  test("Bash metadata: command_type/command_tool/exit_code derived algorithmically", async () => {
+    const db = new SessionDB({ dbPath });
+    const sid = "bash-meta-" + Date.now();
+    db.ensureSession(sid, fakeHome);
+
+    const events = [
+      { type: "cwd",        category: "cwd",   data: "/proj/src",                priority: 2 },
+      { type: "git",        category: "git",   data: "fix: navbar overflow",     priority: 1 },
+      { type: "error_tool", category: "error", data: "FAIL test_foo.py::bar",    priority: 1 },
+    ];
+    const resolveAttribs = (evs: { type: string }[]) =>
+      evs.map(() => ({ projectDir: fakeHome, source: "input_cwd", confidence: 1 }));
+
+    // Simulate hook input for a Bash test command
+    const bashInput = {
+      workspace_roots: [fakeHome],
+      tool_name: "Bash",
+      tool_input: { command: "NODE_ENV=test pnpm exec pytest tests/ --verbose" },
+      tool_response: "FAIL tests/foo.py\nexit status 1",
+    };
+
+    attributeAndInsertEvents(
+      db, sid, events,
+      bashInput, fakeHome,
+      "PostToolUse", resolveAttribs,
+    );
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Every body in this batch should carry Bash metadata.
+    for (const cap of captured) {
+      expect(cap.body.command_tool).toBe("pytest"); // runner-stripped, basename
+      expect(cap.body.command_type).toBe("test");   // canonical verb scan
+      expect(cap.body.exit_code).toBe(1);           // explicit "exit status 1"
+    }
+
+    db.close?.();
+  });
+
+  test("blocker_status: derived from canonical event type, not regex", async () => {
+    const db = new SessionDB({ dbPath });
+    const sid = "blocker-" + Date.now();
+    db.ensureSession(sid, fakeHome);
+
+    const events = [
+      { type: "blocker",          category: "constraint", data: "Stuck on auth flow", priority: 1 },
+      { type: "blocker_resolved", category: "constraint", data: "Auth works now",     priority: 1 },
+      { type: "tool_use",         category: "edit",       data: "Edit('x')",          priority: 2 },
+    ];
+    const resolveAttribs = (evs: { type: string }[]) =>
+      evs.map(() => ({ projectDir: fakeHome, source: "input_cwd", confidence: 1 }));
+
+    attributeAndInsertEvents(
+      db, sid, events,
+      { workspace_roots: [fakeHome] }, fakeHome,
+      "PostToolUse", resolveAttribs,
+    );
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(captured[0].body.blocker_status).toBe("open");
+    expect(captured[1].body.blocker_status).toBe("resolved");
+    expect(captured[2].body.blocker_status).toBeUndefined();
+
+    db.close?.();
+  });
+
+  test("latency_ms: read from PreToolUse marker, duration_bucket derived", async () => {
+    const db = new SessionDB({ dbPath });
+    const sid = "latency-" + Date.now();
+    db.ensureSession(sid, fakeHome);
+
+    // Simulate PreToolUse writing the latency marker 200ms ago
+    const startMs = Date.now() - 200;
+    const markerPath = join(tmpdir(), `context-mode-latency-${sid}-Bash.txt`);
+    writeFileSync(markerPath, String(startMs));
+
+    const events = [{ type: "cwd", category: "cwd", data: "/proj", priority: 2 }];
+    const resolveAttribs = (evs: { type: string }[]) =>
+      evs.map(() => ({ projectDir: fakeHome, source: "input_cwd", confidence: 1 }));
+
+    attributeAndInsertEvents(
+      db, sid, events,
+      { workspace_roots: [fakeHome], tool_name: "Bash", tool_input: { command: "ls" } }, fakeHome,
+      "PostToolUse", resolveAttribs,
+    );
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(typeof captured[0].body.latency_ms).toBe("number");
+    expect(captured[0].body.latency_ms).toBeGreaterThanOrEqual(200);
+    expect(captured[0].body.duration_bucket).toBe("<5s");
+
+    // Cleanup marker
+    try { rmSync(markerPath); } catch { /* */ }
+    db.close?.();
+  });
+
   test("variant matrix — coverage report", async () => {
     const db = new SessionDB({ dbPath });
     const sessionId = "parity-matrix-" + Date.now();
