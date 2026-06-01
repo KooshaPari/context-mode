@@ -48,18 +48,37 @@ async function importFresh() {
   return { bridge, loaders };
 }
 
+// Mirrors hooks/platform-bridge.mjs::configPath() — on Windows the bridge
+// reads APPDATA, on POSIX it reads HOME (via os.homedir()). Tests must
+// write platform.json to whichever directory the bridge will actually look
+// in for the current platform.
+function platformConfigDir(home: string): string {
+  return process.platform === "win32"
+    ? join(home, "AppData", "Roaming", "context-mode")
+    : join(home, ".context-mode");
+}
+
 describe("platform-bridge wire — session-loaders forwards events", () => {
   let fakeHome: string;
   let origHome: string | undefined;
   let origXdg: string | undefined;
+  let origAppdata: string | undefined;
+  let origUserprofile: string | undefined;
   let fetchSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     fakeHome = mkdtempSync(join(tmpdir(), "ctx-bridge-wire-"));
     origHome = process.env.HOME;
     origXdg = process.env.XDG_CONFIG_HOME;
+    origAppdata = process.env.APPDATA;
+    origUserprofile = process.env.USERPROFILE;
     process.env.HOME = fakeHome;
     delete process.env.XDG_CONFIG_HOME;
+    // Windows: configPath() reads APPDATA first, falls back to os.homedir()
+    // (which honors USERPROFILE on Windows). Override both so the fake home
+    // wins regardless of which branch the bridge takes.
+    process.env.APPDATA = join(fakeHome, "AppData", "Roaming");
+    process.env.USERPROFILE = fakeHome;
     fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(null, { status: 200 }),
     );
@@ -70,6 +89,10 @@ describe("platform-bridge wire — session-loaders forwards events", () => {
     else delete process.env.HOME;
     if (origXdg !== undefined) process.env.XDG_CONFIG_HOME = origXdg;
     else delete process.env.XDG_CONFIG_HOME;
+    if (origAppdata !== undefined) process.env.APPDATA = origAppdata;
+    else delete process.env.APPDATA;
+    if (origUserprofile !== undefined) process.env.USERPROFILE = origUserprofile;
+    else delete process.env.USERPROFILE;
     try {
       rmSync(fakeHome, { recursive: true, force: true });
     } catch {}
@@ -133,8 +156,8 @@ describe("platform-bridge wire — session-loaders forwards events", () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     vi.setSystemTime(new Date("2026-06-01T00:00:00Z"));
 
-    mkdirSync(join(fakeHome, ".context-mode"), { recursive: true });
-    const cfgFile = join(fakeHome, ".context-mode", "platform.json");
+    mkdirSync(platformConfigDir(fakeHome), { recursive: true });
+    const cfgFile = join(platformConfigDir(fakeHome), "platform.json");
     writeFileSync(
       cfgFile,
       JSON.stringify({
@@ -182,9 +205,9 @@ describe("platform-bridge wire — session-loaders forwards events", () => {
   });
 
   test("with valid platform.json, N events triggers N fetch calls", async () => {
-    mkdirSync(join(fakeHome, ".context-mode"), { recursive: true });
+    mkdirSync(platformConfigDir(fakeHome), { recursive: true });
     writeFileSync(
-      join(fakeHome, ".context-mode", "platform.json"),
+      join(platformConfigDir(fakeHome), "platform.json"),
       JSON.stringify({
         api_key: "ctxm_wire_test",
         platform_url: "https://example.test/api/v1",
@@ -213,9 +236,9 @@ describe("platform-bridge wire — session-loaders forwards events", () => {
   });
 
   test("project attribution: attributions[i].projectDir flows into POST body (sanitized)", async () => {
-    mkdirSync(join(fakeHome, ".context-mode"), { recursive: true });
+    mkdirSync(platformConfigDir(fakeHome), { recursive: true });
     writeFileSync(
-      join(fakeHome, ".context-mode", "platform.json"),
+      join(platformConfigDir(fakeHome), "platform.json"),
       JSON.stringify({
         api_key: "ctxm_proj_test",
         platform_url: "https://example.test/api/v1",
@@ -254,9 +277,9 @@ describe("platform-bridge wire — session-loaders forwards events", () => {
   });
 
   test("envelope ABI: unknown event fields passthrough to body unchanged", async () => {
-    mkdirSync(join(fakeHome, ".context-mode"), { recursive: true });
+    mkdirSync(platformConfigDir(fakeHome), { recursive: true });
     writeFileSync(
-      join(fakeHome, ".context-mode", "platform.json"),
+      join(platformConfigDir(fakeHome), "platform.json"),
       JSON.stringify({
         api_key: "ctxm_envelope_test",
         platform_url: "https://example.test/api/v1",
@@ -470,9 +493,9 @@ describe("platform-bridge — project identity resolution", () => {
         stdio: "ignore",
       });
 
-      mkdirSync(join(fakeHome, ".context-mode"), { recursive: true });
+      mkdirSync(platformConfigDir(fakeHome), { recursive: true });
       writeFileSync(
-        join(fakeHome, ".context-mode", "platform.json"),
+        join(platformConfigDir(fakeHome), "platform.json"),
         JSON.stringify({
           api_key: "ctxm_resolve_test",
           platform_url: "https://example.test/api/v1",
