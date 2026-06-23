@@ -11,7 +11,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { startLifecycleGuard, makeDefaultIsParentAlive, bridgeChildIdleTimeoutMs, noteMcpActivity, noteRequestStart, noteRequestEnd, attachMcpActivityTap } from "../src/lifecycle.js";
+import { startLifecycleGuard, makeDefaultIsParentAlive, bridgeChildIdleTimeoutMs, noteMcpActivity, noteRequestStart, noteRequestEnd, attachMcpActivityTap, idleReapMessage } from "../src/lifecycle.js";
 
 // Resolve the tsx binary. Prefer the local devDep so the test doesn't depend
 // on a global tsx install or on Git Bash's `which` being on PATH; the PATH
@@ -515,5 +515,69 @@ describe("Lifecycle Guard — bridge-child idle reaper (#854)", () => {
     attachMcpActivityTap(empty);
     assert.equal(empty.onmessage, undefined, "no onmessage → no-op (does not synthesize one)");
     attachMcpActivityTap(null); // must not throw
+  });
+});
+
+describe("idleReapMessage — DX-friendly idle-reaper notice (#854 / #868)", () => {
+  test("uses human units, reassures auto-reconnect, drops alarming 'self-shutdown' wording", () => {
+    const msg = idleReapMessage(180_000);
+    // human units, not raw milliseconds
+    assert.ok(msg.includes("180s"), `expected human seconds, got: ${msg}`);
+    assert.ok(!msg.includes("180000ms"), "must not show raw milliseconds");
+    // reassures the user/ops that it self-heals
+    assert.ok(msg.toLowerCase().includes("reconnect"), "must reassure auto-reconnect");
+    // no scary jargon
+    assert.ok(!msg.includes("self-shutdown"), "must drop 'self-shutdown' wording");
+    // still traceable
+    assert.ok(msg.includes("#854"), "keeps the #854 tag for traceability");
+    assert.ok(msg.includes("[context-mode]"), "keeps the [context-mode] prefix");
+  });
+  test("rounds odd millisecond values to whole seconds", () => {
+    assert.ok(idleReapMessage(5_000).includes("5s"));
+    assert.ok(idleReapMessage(90_000).includes("90s"));
+  });
+});
+
+describe("CONTEXT_MODE_BRIDGE_IDLE_MS — the live env knob the #868 foreground fix sets", () => {
+  test("env CONTEXT_MODE_BRIDGE_IDLE_MS=0 disarms the reaper through the REAL startLifecycleGuard path (not a test override)", async () => {
+    const prevDepth = process.env.CONTEXT_MODE_BRIDGE_DEPTH;
+    const prevIdle = process.env.CONTEXT_MODE_BRIDGE_IDLE_MS;
+    // Foreground child env, exactly as foregroundBridgeEnv produces it.
+    process.env.CONTEXT_MODE_BRIDGE_DEPTH = "1";
+    process.env.CONTEXT_MODE_BRIDGE_IDLE_MS = "0";
+    let shutdownCalled = false;
+    // NB: NO bridgeIdleMs override — exercise the production env-driven path
+    // (server.ts:4871 calls startLifecycleGuard with onShutdown only).
+    const cleanup = startLifecycleGuard({
+      checkIntervalMs: 60_000,        // keep the parent-death poll out of the way
+      isParentAlive: () => true,       // parent ALIVE — only the idle path could fire
+      onShutdown: () => { shutdownCalled = true; },
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(shutdownCalled, false, "IDLE_MS=0 must arm NO idle reaper (foreground stays alive #868)");
+    cleanup();
+    if (prevDepth === undefined) delete process.env.CONTEXT_MODE_BRIDGE_DEPTH; else process.env.CONTEXT_MODE_BRIDGE_DEPTH = prevDepth;
+    if (prevIdle === undefined) delete process.env.CONTEXT_MODE_BRIDGE_IDLE_MS; else process.env.CONTEXT_MODE_BRIDGE_IDLE_MS = prevIdle;
+  });
+
+  test("by contrast, a bridge child with NO override DOES arm the reaper (env knob is what makes the difference)", async () => {
+    const prevDepth = process.env.CONTEXT_MODE_BRIDGE_DEPTH;
+    const prevIdle = process.env.CONTEXT_MODE_BRIDGE_IDLE_MS;
+    process.env.CONTEXT_MODE_BRIDGE_DEPTH = "1";
+    delete process.env.CONTEXT_MODE_BRIDGE_IDLE_MS; // default 180s → reaper armed
+    let shutdownCalled = false;
+    const cleanup = startLifecycleGuard({
+      checkIntervalMs: 60_000,
+      isParentAlive: () => true,
+      bridgeIdleMs: 40,                // idle window tiny; reaper still polls on the 1000ms floor
+      onShutdown: () => { shutdownCalled = true; },
+    });
+    // The reaper poll interval floors at 1000ms (lifecycle.ts), so wait past the
+    // first poll tick to observe the armed reaper fire.
+    await new Promise((r) => setTimeout(r, 1300));
+    assert.equal(shutdownCalled, true, "a non-foreground bridge child still reaps on idle (#854 preserved)");
+    cleanup();
+    if (prevDepth === undefined) delete process.env.CONTEXT_MODE_BRIDGE_DEPTH; else process.env.CONTEXT_MODE_BRIDGE_DEPTH = prevDepth;
+    if (prevIdle === undefined) delete process.env.CONTEXT_MODE_BRIDGE_IDLE_MS; else process.env.CONTEXT_MODE_BRIDGE_IDLE_MS = prevIdle;
   });
 });

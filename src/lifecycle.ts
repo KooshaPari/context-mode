@@ -149,6 +149,20 @@ export function bridgeChildIdleTimeoutMs(env: NodeJS.ProcessEnv = process.env): 
   return 180_000;
 }
 
+/**
+ * #854 / #868: human-readable notice emitted when an idle bridge child is
+ * released. DX-tuned — human units (seconds, not raw ms), reassures that the
+ * helper reconnects automatically (it respawns on the next ctx_* call, #583),
+ * and drops the alarming "self-shutdown" jargon. Pure + exported so the wording
+ * is pinned by a test and stays grep-friendly via the #854 tag. Note: after the
+ * #868 fix this fires ONLY for sub-context / non-interactive children — the
+ * foreground interactive session's child runs with the reaper disabled.
+ */
+export function idleReapMessage(idleMs: number): string {
+  const seconds = Math.round(idleMs / 1000);
+  return `[context-mode] Released an idle MCP helper after ${seconds}s of inactivity to free memory; it reconnects automatically on next use. (#854)`;
+}
+
 // #854 idle-reaper state, module-level by design: an MCP server is exactly one
 // process (one StdioServerTransport + one lifecycle guard), so these are never
 // shared across concurrent servers in production. Multiple startLifecycleGuard()
@@ -272,9 +286,9 @@ export function startLifecycleGuard(opts: LifecycleGuardOptions): () => void {
       // further messages (#643 unbounded calls) — the false-reap regression the
       // adversarial review flagged.
       if (_inFlight === 0 && Date.now() - _lastMcpActivity >= idleMs) {
-        process.stderr.write(
-          `[context-mode] idle MCP bridge child self-shutdown after ${idleMs}ms with no activity (#854)\n`,
-        );
+        // Child's own stderr — the pi bridge forwards it to pi.logger, never the
+        // TUI terminal (#868). DX-tuned wording via idleReapMessage.
+        process.stderr.write(idleReapMessage(idleMs) + "\n");
         shutdown();
       }
     }, Math.max(1000, Math.min(Math.floor(idleMs / 4), 30_000)));

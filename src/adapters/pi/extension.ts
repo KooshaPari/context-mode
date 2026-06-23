@@ -22,7 +22,7 @@ import { extractEvents, extractUserEvents } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
-import { bootstrapMCPTools, type BridgeHandle } from "./mcp-bridge.js";
+import { bootstrapMCPTools, makeBridgeDiag, isForegroundSession, type BridgeHandle } from "./mcp-bridge.js";
 import { PiAdapter } from "./index.js";
 
 // ── Pi Tool Name Mapping ─────────────────────────────────
@@ -338,9 +338,10 @@ function startPiMCPBridge(
   pi: any,
   serverBundle: string,
   shouldKeepHandle: () => boolean,
+  foreground: boolean,
 ): Promise<void> {
   if (existsSync(serverBundle)) {
-    _mcpBridgeReady = bootstrapMCPTools(pi, serverBundle).then(
+    _mcpBridgeReady = bootstrapMCPTools(pi, serverBundle, { foreground }).then(
       (handle) => {
         if (shouldKeepHandle()) {
           _mcpBridge = handle;
@@ -358,9 +359,10 @@ function startPiMCPBridge(
       (err: unknown) => {
         if (!shouldKeepHandle()) return;
         const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(
+        // #868: route to Pi's file logger, never process.stderr (raw-mode TUI).
+        makeBridgeDiag(pi)(
           `[context-mode] WARNING: failed to bridge MCP tools to Pi (${msg}). ` +
-            `ctx_* tools will not be callable from this session.\n`,
+            `ctx_* tools will not be callable from this session.`,
         );
       },
     );
@@ -430,7 +432,7 @@ export default function piExtension(pi: any): void {
   const serverBundle = resolve(pluginRoot, "server.bundle.mjs");
   let mcpBridgeStarted = false;
   let mcpBridgeGeneration = 0;
-  const ensureMCPBridge = (): Promise<void> => {
+  const ensureMCPBridge = (foreground: boolean): Promise<void> => {
     if (mcpBridgeStarted) return _mcpBridgeReady;
     mcpBridgeStarted = true;
     const generation = ++mcpBridgeGeneration;
@@ -438,6 +440,7 @@ export default function piExtension(pi: any): void {
       pi,
       serverBundle,
       () => mcpBridgeStarted && mcpBridgeGeneration === generation,
+      foreground,
     );
   };
   // Issue #545 — Pi workspace resolver. PI_CONFIG_DIR is Pi's CONFIG dir
@@ -601,7 +604,7 @@ export default function piExtension(pi: any): void {
 
   // ── 4. before_agent_start — Routing + active_memory + resume injection ─
 
-  pi.on("before_agent_start", async (event: any) => {
+  pi.on("before_agent_start", async (event: any, ctx: any) => {
     try {
       _pendingContext = ""; // Reset — will be filled below if events exist
       // Lazily start and await the MCP bridge only when Pi is about to
@@ -612,7 +615,24 @@ export default function piExtension(pi: any): void {
       // here ensures ctx_* tools are registered before Pi snapshots the tool
       // registry for the model call. Resolves on bootstrap failure too — the
       // bridge is best-effort.
-      await ensureMCPBridge();
+      //
+      // #868: the FOREGROUND interactive session's bridge child is spawned with
+      // the #854 idle reaper disabled (via ctx.hasUI), so a multi-minute human
+      // pause never drops its ctx_* tools. Subagents (hasUI:false) keep the
+      // reaper so abandoned children can't accumulate (#854).
+      //
+      // INVARIANT — deciding foreground on the FIRST before_agent_start is safe
+      // even though the bridge spawns single-flight (first-wins, no sticky
+      // latch): Pi wires the interactive uiContext inside `mode.init()`, which
+      // main.ts AWAITS before dispatching the first prompt — and
+      // before_agent_start is emitted only from the per-turn prompt path. So the
+      // foreground session's first hook ALWAYS observes hasUI:true; subagents are
+      // provably hasUI:false. There is no early-init window where the foreground
+      // transiently reads hasUI:false (that window is scoped to a separate,
+      // buffered credential event). Do NOT add a latch here — it would guard an
+      // unreachable state. (Verified against oh-my-pi: main.ts init→prompt order,
+      // interactive-mode.ts uiContext wiring, executor.ts subagent hasUI:false.)
+      await ensureMCPBridge(isForegroundSession(ctx));
 
       if (!_sessionId) return;
 

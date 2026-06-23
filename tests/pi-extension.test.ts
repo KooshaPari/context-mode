@@ -1507,22 +1507,28 @@ describe("Pi MCP bridge (#426)", () => {
   // bounded at 5s, shutdown awaits bridge bootstrap up to 2s.
 
   describe("Pi bridge resilience (#472 round-3)", () => {
-    it("captures child stderr instead of swallowing it (case 1: crash diagnostics)", async () => {
+    it("routes child stderr to pi.logger, NOT the TUI terminal (case 1: crash diagnostics; #472 intent / #868)", async () => {
       // Server writes a diagnostic line to stderr then exits non-zero,
       // mimicking a real crash during initialize. With stdio[2] = "ignore"
-      // the diagnostic vanishes; with "pipe" it must reach process.stderr.
+      // the diagnostic vanishes (#472). We keep capturing it — but route it
+      // through `diag` (Pi's file logger), NEVER process.stderr, because Pi's
+      // raw-mode TUI renders any console write into the editor box (#868).
       const fakePath = writeFakeServer(`
         process.stderr.write("FAKE_MCP_CRASH_DIAG: bundle corrupted at line 42\\n");
         process.exit(1);
       `);
       const { MCPStdioClient } = await import("../src/adapters/pi/mcp-bridge.js");
-      const client = new MCPStdioClient(fakePath);
+      const logged: string[] = [];
+      const client = new MCPStdioClient(fakePath, process.env, null, (line) =>
+        logged.push(line),
+      );
 
-      const captured: string[] = [];
+      // Guard: nothing the child writes may reach process.stderr (Pi's TUI).
+      const stderrCaptured: string[] = [];
       const origWrite = process.stderr.write.bind(process.stderr);
       // @ts-expect-error monkeypatch
       process.stderr.write = (chunk: any, ...rest: any[]) => {
-        captured.push(typeof chunk === "string" ? chunk : chunk.toString("utf-8"));
+        stderrCaptured.push(typeof chunk === "string" ? chunk : chunk.toString("utf-8"));
         return origWrite(chunk, ...rest);
       };
 
@@ -1536,10 +1542,13 @@ describe("Pi MCP bridge (#426)", () => {
         client.shutdown();
       }
 
-      const all = captured.join("");
-      expect(all).toMatch(/FAKE_MCP_CRASH_DIAG/);
-      // Prefix lets ops grep across the noise of a real session.
-      expect(all).toMatch(/\[mcp-bridge\]/);
+      const all = logged.join("\n");
+      // #472 intent preserved: the crash diagnostic is captured (now in the log)…
+      expect(all.includes("FAKE_MCP_CRASH_DIAG")).toBe(true);
+      // …with the [mcp-bridge] prefix so ops can grep ~/.omp/logs.
+      expect(all.includes("[mcp-bridge]")).toBe(true);
+      // #868: it must NOT have been written to the terminal.
+      expect(stderrCaptured.join("").includes("FAKE_MCP_CRASH_DIAG")).toBe(false);
     }, 10_000);
 
     it.skipIf(process.platform === "win32")("escalates to SIGKILL when SIGTERM is ignored (case 2: bounded shutdown)", async () => {
