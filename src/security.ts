@@ -16,6 +16,51 @@ export interface SecurityPolicy {
 }
 
 // ==============================================================================
+// Security Posture (configurable fail-open vs fail-closed)
+// ==============================================================================
+
+/**
+ * Pure / cache-resolved helper: is the server deny check allowed to fail-open
+ * on resolver / I/O errors?
+ *
+ * Backstory — the deny firewall historically swallowed every error and
+ * allowed the command through (see original `isPathInsideProject` comment
+ * header and `server.ts::checkDenyPolicy`). For a security gate the
+ * "best-effort denies on bug" posture is dangerous: an exploitable I/O bug
+ * becomes a silent allow. The remediation backlog asks for the posture to
+ * be configurable and default-*closed* for the execute path.
+ *
+ * Reads `CONTEXT_MODE_FAIL_OPEN`:
+ *   - unset / "0" / "false" / "no" / "off"  → CLOSED (return false; deny)
+ *   - "1" / "true" / "yes"                   → OPEN   (return true;  allow)
+ *
+ * Set OPEN=true ONLY when the surrounding host (Claude Code hooks, etc.)
+ * already enforces the same deny list — i.e. when the MCP server is the
+ * second-line defense. The default (closed) is correct for every deployment
+ * where hooks are NOT configured.
+ *
+ * Tested via tests/security/posture.test.ts.
+ */
+export function resolveSecurityPosture(
+  env: NodeJS.ProcessEnv = process.env,
+): "open" | "closed" {
+  const raw = env.CONTEXT_MODE_FAIL_OPEN;
+  if (raw === undefined) return "closed";
+  const v = String(raw).trim().toLowerCase();
+  if (v === "" || v === "0" || v === "false" || v === "no" || v === "off") {
+    return "closed";
+  }
+  return "open";
+}
+
+/** Convenience boolean wrapper around `resolveSecurityPosture()`. */
+export function isSecurityFailOpen(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return resolveSecurityPosture(env) === "open";
+}
+
+// ==============================================================================
 // Pattern Parsing
 // ==============================================================================
 
@@ -560,6 +605,66 @@ export function evaluateCommand(
   }
 
   return { decision: "ask" };
+}
+
+/**
+ * Strict / allowlist variant of `evaluateCommandDenyOnly`.
+ *
+ * Default posture is **deny**: a command is allowed only when an explicit
+ * `permissions.allow` rule (`Bash(...)` glob) matches every segment (main or
+ * nested subshell) AND no deny rule matches. This inverts the deny-only /
+ * default-allow posture and is the strict-mode piece of the remediation
+ * backlog item "add a strict allowlist mode so 'not explicitly allowed' no
+ * longer means 'executes'".
+ *
+ * Activation: opt-in via `CONTEXT_MODE_STRICT_MODE=1`. The MCP server wires
+ * this through `checkDenyPolicy` (see `server.ts`).
+ *
+ * Decision flow:
+ *   1. ANY segment matches a deny pattern               → `deny` (with glob)
+ *   2. EVERY segment matches an allow pattern in some policy → `allow`
+ *   3. Otherwise                                         → `deny` (no glob;
+ *                                                           unmatched-segment
+ *                                                           boundary)
+ *
+ * Mirrors `evaluateCommandDenyOnly`'s return shape for caller ergonomics.
+ * Tested via tests/security/strict-mode.test.ts.
+ */
+export function evaluateCommandStrict(
+  command: string,
+  policies: SecurityPolicy[],
+  caseInsensitive: boolean = process.platform === "win32" || process.platform === "darwin",
+): { decision: "allow" | "deny"; matchedPattern?: string } {
+  const allCommands = collectCommandElements(command);
+
+  // 1. Deny check (highest priority — runs first regardless of allow set).
+  for (const cmdElement of allCommands) {
+    for (const policy of policies) {
+      const denyMatch = matchesAnyPattern(cmdElement, policy.deny, caseInsensitive);
+      if (denyMatch) return { decision: "deny", matchedPattern: denyMatch };
+    }
+  }
+
+  // 2. STRICT allow check — every segment must match an explicit allow rule.
+  // As soon as one segment has no allow match in ANY policy, deny.
+  for (const cmdElement of allCommands) {
+    const hasAllow = policies.some((policy) =>
+      matchesAnyPattern(cmdElement, policy.allow, caseInsensitive) !== null,
+    );
+    if (!hasAllow) {
+      return { decision: "deny", matchedPattern: undefined };
+    }
+  }
+
+  // 3. All segments matched an allow glob — emit the first for diagnostics.
+  for (const cmdElement of allCommands) {
+    for (const policy of policies) {
+      const allow = matchesAnyPattern(cmdElement, policy.allow, caseInsensitive);
+      if (allow) return { decision: "allow", matchedPattern: allow };
+    }
+  }
+
+  return { decision: "allow" };
 }
 
 /**

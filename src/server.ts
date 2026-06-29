@@ -17,11 +17,13 @@ import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
   evaluateCommandDenyOnly,
+  evaluateCommandStrict,
   extractShellCommands,
   readToolDenyPatterns,
   readToolPermissionPatterns,
   evaluateFilePath,
   evaluateProjectContainment,
+  resolveSecurityPosture,
 } from "./security.js";
 import {
   detectRuntimes,
@@ -1095,6 +1097,16 @@ function persistStats(): void {
 /**
  * Check a shell command against Bash deny patterns.
  * Returns an error ToolResult if denied, or null if allowed.
+ *
+ * Posture (audit remediation backlog #2): on resolver / I/O failure the
+ * default posture is **fail-closed** — return a blocking error instead of
+ * silently allowing the command through. Operators who intentionally want
+ * the legacy fail-open posture (e.g. when host hooks already enforce the
+ * same deny list) opt in with `CONTEXT_MODE_FAIL_OPEN=1`.
+ *
+ * Mode: when `CONTEXT_MODE_STRICT_MODE=1`, this switches from
+ * `evaluateCommandDenyOnly` (default-allow) to `evaluateCommandStrict`
+ * (default-deny / require explicit allow globs).
  */
 function checkDenyPolicy(
   command: string,
@@ -1102,25 +1114,45 @@ function checkDenyPolicy(
 ): ToolResult | null {
   try {
     const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
-    const result = evaluateCommandDenyOnly(command, policies);
+    const strict = process.env.CONTEXT_MODE_STRICT_MODE === "1";
+    const result = strict
+      ? evaluateCommandStrict(command, policies)
+      : evaluateCommandDenyOnly(command, policies);
     if (result.decision === "deny") {
+      const label = strict ? "strict-mode deny" : "deny pattern";
+      const glob = result.matchedPattern ?? "(no allow rule)";
       return trackResponse(toolName, {
         content: [{
           type: "text" as const,
-          text: `Command blocked by security policy: matches deny pattern ${result.matchedPattern}`,
+          text: `Command blocked by security policy: matches ${label} ${glob}`,
         }],
         isError: true,
       });
     }
   } catch {
-    // Security check failed — allow through (fail-open for server,
-    // hooks are the primary enforcement layer)
+    // Security check failed. Posture is configurable via
+    // CONTEXT_MODE_FAIL_OPEN (default closed) — see resolveSecurityPosture
+    // in security.ts. The legacy default-allow behavior is recoverable for
+    // hook-enforced deployments by setting the env var explicitly.
+    if (resolveSecurityPosture() === "closed") {
+      return trackResponse(toolName, {
+        content: [{
+          type: "text" as const,
+          text: `Command blocked by security policy: deny check unavailable (posture=closed). To allow through, set CONTEXT_MODE_FAIL_OPEN=1 or fix the underlying settings/IO error.`,
+        }],
+        isError: true,
+      });
+    }
+    // Fall through — legacy behavior (fail-open).
   }
   return null;
 }
 
 /**
  * Check non-shell code for shell-escape calls against deny patterns.
+ *
+ * Posture (see `checkDenyPolicy` above) is honored symmetrically. Strict
+ * mode also flips this gate from default-allow to default-deny.
  */
 function checkNonShellDenyPolicy(
   code: string,
@@ -1131,20 +1163,34 @@ function checkNonShellDenyPolicy(
     const commands = extractShellCommands(code, language);
     if (commands.length === 0) return null;
     const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
+    const strict = process.env.CONTEXT_MODE_STRICT_MODE === "1";
     for (const cmd of commands) {
-      const result = evaluateCommandDenyOnly(cmd, policies);
+      const result = strict
+        ? evaluateCommandStrict(cmd, policies)
+        : evaluateCommandDenyOnly(cmd, policies);
       if (result.decision === "deny") {
+        const label = strict ? "strict-mode deny" : "deny pattern";
+        const glob = result.matchedPattern ?? "(no allow rule)";
         return trackResponse(toolName, {
           content: [{
             type: "text" as const,
-            text: `Command blocked by security policy: embedded shell command "${cmd}" matches deny pattern ${result.matchedPattern}`,
+            text: `Command blocked by security policy: embedded shell command "${cmd}" matches ${label} ${glob}`,
           }],
           isError: true,
         });
       }
     }
   } catch {
-    // Fail-open
+    // Fail-closed by default; opt-in fail-open via CONTEXT_MODE_FAIL_OPEN.
+    if (resolveSecurityPosture() === "closed") {
+      return trackResponse(toolName, {
+        content: [{
+          type: "text" as const,
+          text: `Command blocked by security policy: deny check unavailable (posture=closed). To allow through, set CONTEXT_MODE_FAIL_OPEN=1 or fix the underlying settings/IO error.`,
+        }],
+        isError: true,
+      });
+    }
   }
   return null;
 }

@@ -60,6 +60,161 @@ export function buildSpawnOptions(platform: NodeJS.Platform): { windowsHide: boo
   return { windowsHide: platform === "win32" };
 }
 
+// ==============================================================================
+// Secret-env scrubbing (audit remediation backlog #3 — L18/L29)
+// ==============================================================================
+
+/**
+ * Pure / cached helper: should the executor refuse to forward vars whose names
+ * or values look like secrets into spawned code?
+ *
+ * Reads `CONTEXT_MODE_STRIP_SECRET_ENV`. Default is **OFF** for back-compat —
+ * existing operators' tool chains may rely on inherited envs. Opt-in only.
+ *
+ * Tests: tests/executor/secret-env.test.ts.
+ */
+export function shouldStripSecretEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const raw = env.CONTEXT_MODE_STRIP_SECRET_ENV;
+  if (raw === undefined) return false;
+  const v = String(raw).trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+/**
+ * Pure helper — does an env var NAME look like a secret? Matches common
+ * credential suffixes/prefixes (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`,
+ * `*_PASS`, `*_CRED*`, `*_AUTH`, `*_DSN`, `AWS_*`, `GITHUB_*`, `GH_*`,
+ * `OPENAI_*`, `ANTHROPIC_*`). Case-insensitive.
+ *
+ * Intentionally not exhaustive: false positives are cheap (a script just has
+ * to set the env again); false negatives leak. The list is a curated
+ * superset of common dotenv / 12-factor conventions.
+ */
+export function isSecretName(name: string): boolean {
+  const u = name.toUpperCase();
+  // Catch patterns like "*_KEY", "*_TOKEN", "*_SECRET", "*_PASS(WD)?",
+  // "*_CRED*", "*_AUTH", "*_DSN", "*_PRIVATE_KEY".
+  const SUFFIX = /(?:^|_)(KEY|TOKEN|SECRET|PASS(?:WORD)?|CRED(?:ENTIAL)?S?|AUTH(?:ORIZATION)?|DSN|PRIVATE[_-]KEY)$/;
+  if (SUFFIX.test(u)) return true;
+  // Known provider prefixes.
+  const PREFIX = /^(AWS|GH|GITHUB|GITLAB|OPENAI|ANTHROPIC|GEMINI|VERTEX|COHERE|ML_|HF_|HUGGINGFACE|AZURE|GCP|NPM|NVIDIA|PERPLEXITY|TOGETHER|REPLICATE|FIREWORKS|HELICONE|OPENROUTER|GROQ|XAI|MISTRAL|TOGETRAI|TOGETHERAI|TRELLO|STRIPE|SENDGRID|SLACK|DISCORD|MAILGUN|TWILIO)_(?:.*)?$/;
+  if (PREFIX.test(u)) return true;
+  return false;
+}
+
+/**
+ * Pure helper — does an env var VALUE look like a high-entropy secret?
+ * Matches:
+ *   - `sk-...`     (OpenAI / Anthropic / many providers)
+ *   - `sk-ant-...` (Anthropic-specific)
+ *   - `ghp_/gho_/ghs_/ghu_/ghr_*` (GitHub PAT family)
+ *   - `xox[bpars]-...` (Slack tokens)
+ *   - `AKIA[0-9A-Z]{16}` (AWS access key id)
+ *   - AWS secret access key shape: 40 base64-ish chars in typical contexts
+ *   - Generic JWT (three base64url segments separated by dots)
+ *
+ * Conservative — false positives are cheaper than false negatives. Length
+ * threshold prevents matching the literal three-letter word "key".
+ */
+export function isSecretValue(value: string): boolean {
+  if (typeof value !== "string") return false;
+  const v = value.trim();
+  if (v.length < 16) return false; // tokens / keys are long; short strings are usually not secrets
+  // OpenAI / Anthropic / OpenRouter style
+  if (/^sk-(?:ant-|proj-|or-|sv-|[A-Za-z0-9_-]+)/i.test(v)) return true;
+  // GitHub PAT family
+  if (/^(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/i.test(v)) return true;
+  // Slack tokens
+  if (/^xox[bpars]-[A-Za-z0-9-]{10,}/i.test(v)) return true;
+  // AWS access key id
+  if (/^AKIA[0-9A-Z]{16}$/.test(v)) return true;
+  // JWT (three segments, base64url, dot-separated)
+  if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(v) && v.length > 40) return true;
+  // Stripe live / test keys
+  if (/^(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{20,}$/i.test(v)) return true;
+  // SendGrid
+  if(/^SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}$/.test(v)) return true;
+  return false;
+}
+
+/**
+ * Pure helper — exported for unit testing.
+ *
+ * Build a child-process env from a parent env + the existing deny list +
+ * (optionally) the secret-name and secret-value scrubber. Mirrors the
+ * body of `#buildSafeEnv` but stays as a pure function so it can be unit
+ * tested without spawning a process.
+ *
+ * `extraDenied` adds extra names to the deny list (e.g. for tests).
+ * `stripSecrets` enables the name- and value-based scrubber.
+ */
+export function buildSandboxEnv(
+  parentEnv: NodeJS.ProcessEnv,
+  opts: {
+    tmpDir: string;
+    isWin?: boolean;
+    extraDenied?: ReadonlySet<string>;
+    stripSecrets?: boolean;
+    secretNameFn?: (name: string) => boolean;
+    secretValueFn?: (value: string) => boolean;
+  },
+): Record<string, string> {
+  const isWin = opts.isWin ?? process.platform === "win32";
+  const realHome = parentEnv.HOME ?? parentEnv.USERPROFILE ?? opts.tmpDir;
+  const denied = new Set<string>([
+    "BASH_ENV","ENV","PROMPT_COMMAND","PS4","SHELLOPTS","BASHOPTS","CDPATH","INPUTRC","BASH_XTRACEFD",
+    "NODE_OPTIONS","NODE_PATH",
+    "PYTHONSTARTUP","PYTHONHOME","PYTHONWARNINGS","PYTHONBREAKPOINT","PYTHONINSPECT",
+    "RUBYOPT","RUBYLIB",
+    "PERL5OPT","PERL5LIB","PERLLIB","PERL5DB",
+    "ERL_AFLAGS","ERL_FLAGS","ELIXIR_ERL_OPTIONS","ERL_LIBS",
+    "GOFLAGS","CGO_CFLAGS","CGO_LDFLAGS",
+    "RUSTC","RUSTC_WRAPPER","RUSTC_WORKSPACE_WRAPPER","CARGO_BUILD_RUSTC","CARGO_BUILD_RUSTC_WRAPPER","RUSTFLAGS",
+    "PHPRC","PHP_INI_SCAN_DIR",
+    "R_PROFILE","R_PROFILE_USER","R_HOME",
+    "DOTNET_STARTUP_HOOKS","DOTNET_ADDITIONAL_DEPS","DOTNET_SHARED_STORE","DOTNET_ROOT","DOTNET_ROOT(x86)","DOTNET_HOST_PATH",
+    "CORECLR_PROFILER","CORECLR_PROFILER_PATH","CORECLR_PROFILER_PATH_32","CORECLR_PROFILER_PATH_64","CORECLR_PROFILER_PATH_ARM32","CORECLR_PROFILER_PATH_ARM64","CORECLR_ENABLE_PROFILING",
+    "DOTNET_PROFILER_PATH","DOTNET_PROFILER_PATH_32","DOTNET_PROFILER_PATH_64","DOTNET_PROFILER_PATH_ARM32","DOTNET_PROFILER_PATH_ARM64","DOTNET_DiagnosticPorts","DOTNET_BUNDLE_EXTRACT_BASE_DIR",
+    "LD_PRELOAD","DYLD_INSERT_LIBRARIES",
+    "OPENSSL_CONF","OPENSSL_ENGINES",
+    "CC","CXX","AR",
+    "GIT_TEMPLATE_DIR","GIT_CONFIG_GLOBAL","GIT_CONFIG_SYSTEM","GIT_EXEC_PATH","GIT_SSH","GIT_SSH_COMMAND","GIT_ASKPASS",
+  ]);
+  if (opts.extraDenied) {
+    for (const k of opts.extraDenied) denied.add(k);
+  }
+  const strip = !!opts.stripSecrets;
+  const nameFn = opts.secretNameFn ?? isSecretName;
+  const valueFn = opts.secretValueFn ?? isSecretValue;
+  const env: Record<string, string> = {};
+  for (const [key, val] of Object.entries(parentEnv)) {
+    if (val === undefined) continue;
+    if (denied.has(key)) continue;
+    if (key.startsWith("BASH_FUNC_")) continue;
+    if (/^COMPlus_/i.test(key)) continue;
+    if (strip && nameFn(key)) continue;
+    if (strip && valueFn(val)) continue;
+    env[key] = val;
+  }
+  env["TMPDIR"] = opts.tmpDir;
+  env["HOME"] = realHome;
+  env["LANG"] = "en_US.UTF-8";
+  env["PYTHONDONTWRITEBYTECODE"] = "1";
+  env["PYTHONUNBUFFERED"] = "1";
+  env["PYTHONUTF8"] = "1";
+  env["NO_COLOR"] = "1";
+  if (isWin && !env["PATH"] && env["Path"]) {
+    env["PATH"] = env["Path"];
+    delete env["Path"];
+  }
+  if (!env["PATH"]) {
+    env["PATH"] = isWin ? "" : "/usr/local/bin:/usr/bin:/bin";
+  }
+  return env;
+}
+
 function quoteForPosixShell(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -570,140 +725,25 @@ export class PolyglotExecutor {
     });
   }
 
+  /**
+   * Build the child-process env for a sandboxed spawn.
+   *
+   * Delegates the dangerous-var filter (DENIED set, BASH_FUNC_*, COMPlus_*)
+   * plus the opt-in secret-name / secret-value scrubber to the pure helper
+   * `buildSandboxEnv`. This ensures `CONTEXT_MODE_STRIP_SECRET_ENV=1` actually
+   * takes effect on spawned code (audit remediation backlog #3 — L18/L29).
+   *
+   * The downstream customizations below (Windows MSYS path-conv strip,
+   * Git Bash PATH prepend, SSL_CERT_FILE auto-detect) are pure env mutations
+   * on top of the filtered base and do not weaken the deny/strip guarantees
+   * from `buildSandboxEnv`.
+   */
   #buildSafeEnv(tmpDir: string): Record<string, string> {
-    const realHome = process.env.HOME ?? process.env.USERPROFILE ?? tmpDir;
-
-    // Denylist: env vars that corrupt sandbox stdout, inject code, or break
-    // language runtimes. Each entry is backed by CVE, MITRE, or live testing.
-    // See: https://www.elttam.com/blog/env/, MITRE T1574.006
-    const DENIED = new Set([
-      // Shell — auto-execute scripts, override builtins
-      "BASH_ENV",             // sourced by non-interactive bash
-      "ENV",                  // sourced by sh/dash
-      "PROMPT_COMMAND",       // runs before each prompt
-      "PS4",                  // $(cmd) expansion in xtrace
-      "SHELLOPTS",            // enables xtrace/verbose, dumps to stdout
-      "BASHOPTS",             // bash-specific shell options
-      "CDPATH",               // makes cd print to stdout
-      "INPUTRC",              // readline key rebinding
-      "BASH_XTRACEFD",        // redirects debug output to stdout
-      // Node.js — require injection, inspector
-      "NODE_OPTIONS",         // --require, --loader, --inspect
-      "NODE_PATH",            // module search path injection
-      // Python — stdlib override, startup injection
-      "PYTHONSTARTUP",        // auto-executes in interactive mode
-      "PYTHONHOME",           // overrides stdlib location (breaks Python)
-      "PYTHONWARNINGS",       // triggers module import chain → RCE
-      "PYTHONBREAKPOINT",     // arbitrary callable
-      "PYTHONINSPECT",        // enters interactive mode after script
-      // Ruby — option/module injection
-      "RUBYOPT",              // injects CLI options (-r loads files)
-      "RUBYLIB",              // module search path injection
-      // Perl — option/module injection
-      "PERL5OPT",             // injects CLI options (-M runs code)
-      "PERL5LIB",             // module search path injection
-      "PERLLIB",              // legacy module search path
-      "PERL5DB",              // debugger command injection
-      // Elixir/Erlang — eval injection
-      "ERL_AFLAGS",           // prepends erl flags (-eval runs code)
-      "ERL_FLAGS",            // appends erl flags
-      "ELIXIR_ERL_OPTIONS",   // Elixir-specific erl flags
-      "ERL_LIBS",             // beam file loading
-      // Go — compiler/linker injection
-      "GOFLAGS",              // injects go command flags
-      "CGO_CFLAGS",           // C compiler flag injection
-      "CGO_LDFLAGS",          // linker flag injection
-      // Rust — compiler substitution
-      "RUSTC",                // arbitrary compiler binary
-      "RUSTC_WRAPPER",        // compiler wrapper injection
-      "RUSTC_WORKSPACE_WRAPPER",
-      "CARGO_BUILD_RUSTC",
-      "CARGO_BUILD_RUSTC_WRAPPER",
-      "RUSTFLAGS",            // compiler flag injection
-      // PHP — config injection
-      "PHPRC",                // auto_prepend_file → RCE
-      "PHP_INI_SCAN_DIR",     // additional .ini loading
-      // R — startup script injection
-      "R_PROFILE",            // site-wide R profile
-      "R_PROFILE_USER",       // user R profile
-      "R_HOME",               // R installation override
-      // .NET / C# — runtime/startup hooks, additional deps
-      "DOTNET_STARTUP_HOOKS",       // injects managed assemblies on startup
-      "DOTNET_ADDITIONAL_DEPS",     // additional .deps.json injection
-      "DOTNET_SHARED_STORE",        // shared assembly probe path injection
-      "DOTNET_ROOT",                // arbitrary .NET runtime override
-      "DOTNET_ROOT(x86)",           // 32-bit override
-      "DOTNET_HOST_PATH",           // host binary substitution
-      // .NET / C# — profiler attach (loads arbitrary DLL into dotnet host)
-      // and IPC-based debugger/IL injection. PR #546 follow-up.
-      // learn.microsoft.com/en-us/dotnet/core/runtime-config/debugging-profiling
-      "CORECLR_PROFILER",                 // CLSID of profiler to attach
-      "CORECLR_PROFILER_PATH",            // path to profiler DLL
-      "CORECLR_PROFILER_PATH_32",         // 32-bit specific profiler DLL
-      "CORECLR_PROFILER_PATH_64",         // 64-bit specific profiler DLL
-      "CORECLR_PROFILER_PATH_ARM32",      // ARM32 specific profiler DLL
-      "CORECLR_PROFILER_PATH_ARM64",      // ARM64 specific profiler DLL
-      "CORECLR_ENABLE_PROFILING",         // gates profiler load
-      "DOTNET_PROFILER_PATH",             // cross-platform alias
-      "DOTNET_PROFILER_PATH_32",
-      "DOTNET_PROFILER_PATH_64",
-      "DOTNET_PROFILER_PATH_ARM32",
-      "DOTNET_PROFILER_PATH_ARM64",
-      "DOTNET_DiagnosticPorts",           // peer attach via diagnostic IPC
-      "DOTNET_BUNDLE_EXTRACT_BASE_DIR",   // single-file extraction hijack
-      // Dynamic linker — shared library injection
-      "LD_PRELOAD",           // loads .so before all others (Linux)
-      "DYLD_INSERT_LIBRARIES", // macOS equivalent of LD_PRELOAD
-      // OpenSSL — engine loading
-      "OPENSSL_CONF",         // loads engine modules → .so exec
-      "OPENSSL_ENGINES",      // engine directory override
-      // Compiler — binary substitution
-      "CC",                   // C compiler override
-      "CXX",                  // C++ compiler override
-      "AR",                   // archiver override
-      // Git — command injection via hooks/config
-      "GIT_TEMPLATE_DIR",     // hook injection on git init
-      "GIT_CONFIG_GLOBAL",    // core.pager/editor runs commands
-      "GIT_CONFIG_SYSTEM",    // system-level config injection
-      "GIT_EXEC_PATH",        // substitute git subcommands
-      "GIT_SSH",              // arbitrary command instead of ssh
-      "GIT_SSH_COMMAND",      // arbitrary ssh command
-      "GIT_ASKPASS",          // arbitrary credential command
-    ]);
-
-    // Start with parent env, then strip dangerous vars and apply overrides.
-    // The `COMPlus_` prefix sweep covers every COMPlus_* synonym of the
-    // DOTNET_* runtime knobs (.NET back-compat alias — case-insensitive).
-    // PR #546 follow-up: closes the alias bypass for the explicit denylist
-    // entries above.
-    const env: Record<string, string> = {};
-    for (const [key, val] of Object.entries(process.env)) {
-      if (
-        val !== undefined &&
-        !DENIED.has(key) &&
-        !key.startsWith("BASH_FUNC_") &&
-        !/^COMPlus_/i.test(key)
-      ) {
-        env[key] = val;
-      }
-    }
-
-    // Sandbox overrides — forced values for correct sandbox behavior
-    env["TMPDIR"] = tmpDir;
-    env["HOME"] = realHome;
-    env["LANG"] = "en_US.UTF-8";
-    env["PYTHONDONTWRITEBYTECODE"] = "1";
-    env["PYTHONUNBUFFERED"] = "1";
-    env["PYTHONUTF8"] = "1";
-    env["NO_COLOR"] = "1";
-    // Windows uses "Path" (not "PATH") — normalize to "PATH" for consistency
-    if (isWin && !env["PATH"] && env["Path"]) {
-      env["PATH"] = env["Path"];
-      delete env["Path"];
-    }
-    if (!env["PATH"]) {
-      env["PATH"] = isWin ? "" : "/usr/local/bin:/usr/bin:/bin";
-    }
+    const env = buildSandboxEnv(process.env, {
+      tmpDir,
+      isWin,
+      stripSecrets: shouldStripSecretEnv(),
+    });
 
     // Windows-critical PATH fixes.
     if (isWin) {
